@@ -32,6 +32,8 @@
 #include "utilities/align.hpp"
 #include "utilities/debug.hpp"
 #include "utilities/growableArray.hpp"
+#include <string>
+#include <sstream>
 
 ZPage::ZPage(ZPageType type, const ZVirtualMemory& vmem, const ZPhysicalMemory& pmem)
   : _type(type),
@@ -46,7 +48,13 @@ ZPage::ZPage(ZPageType type, const ZVirtualMemory& vmem, const ZPhysicalMemory& 
     _remembered_set(),
     _last_used(0),
     _physical(pmem),
-    _node() {
+    _node(),
+    _allocator(nullptr),
+    _exhausted(false),
+    _bytes_freed(0),
+    _bytes_used(0),
+    _failed_relocation_size(0),
+    _free_list_time(0) {
   assert(!_virtual.is_null(), "Should not be null");
   assert(!_physical.is_null(), "Should not be null");
   assert(_virtual.size() == _physical.size(), "Virtual/Physical size mismatch");
@@ -81,6 +89,9 @@ const ZGeneration* ZPage::generation() const {
 void ZPage::reset_seqnum() {
   Atomic::store(&_seqnum, generation()->seqnum());
   Atomic::store(&_seqnum_other, ZGeneration::generation(_generation_id == ZGenerationId::young ? ZGenerationId::old : ZGenerationId::young)->seqnum());
+}
+void ZPage::reset_recycling_seqnum() {
+  Atomic::store(&_recycling_seqnum, generation()->seqnum());
 }
 
 void ZPage::remset_clear() {
@@ -149,6 +160,7 @@ void ZPage::reset(ZPageAge age, ZPageResetType type) {
 
   reset_seqnum();
 
+
   // Flip aged pages are still filled with the same objects, need to retain the top pointer.
   if (type != ZPageResetType::FlipAging) {
     _top = to_zoffset_end(start());
@@ -157,7 +169,7 @@ void ZPage::reset(ZPageAge age, ZPageResetType type) {
   reset_remembered_set();
   verify_remset_after_reset(prev_age, type);
 
-  if (type != ZPageResetType::InPlaceRelocation || (prev_age != ZPageAge::old && age == ZPageAge::old)) {
+  if (type != ZPageResetType::InPlaceRelocation &&   (prev_age != ZPageAge::old && age == ZPageAge::old)) {
     // Promoted in-place relocations reset the live map,
     // because they clone the page.
     _livemap.reset();
@@ -314,4 +326,155 @@ void ZPage::fatal_msg(const char* msg) const {
   stringStream ss;
   print_on_msg(&ss, msg);
   fatal("%s", ss.base());
+}
+
+bool ZPage::init_free_list() {
+  _free_list_time = os::elapsed_counter();
+  assert(this->age() != ZPageAge::old, "Cannot construct free lists in old pages");
+  assert(this->type() == ZPageType::small, "Free Lists can only exist in small pages");
+
+  _failed_relocation_size = 0;
+  _exhausted = false;
+  _bytes_freed = 0;
+  _bytes_used = 0;
+
+  if(_allocator){
+    //reset the current allocator, and mark entire page as allocated
+    _allocator->reset();
+  } else {
+    //create a new allocator
+    _allocator = new ZAllocatorWrapper((void*)ZOffset::address(start()), size(), 0, true, ZUseBuddyAllocator);
+  }
+
+  //Reconstruct the free list from the livemap
+  //
+  //Resetting a free list allocator assumes allocating all the
+  //space available, and we are reconstructing it by freeing the
+  //spaces inbetween live objects.
+  zaddress curr = ZOffset::address(this->start());
+  auto free_internal_range = [&](BitMap::idx_t idx) -> bool {
+    zaddress addr = ZOffset::address(offset_from_bit_index(idx));
+    size_t free_size = align_down(addr - curr, object_alignment());
+    if(free_size >= (long unsigned int)ZMinFreeBlockSize) {
+      assert(curr >= ZOffset::address(this->start()), "free_range starts before page start");
+      assert(curr + free_size < ZOffset::address(to_zoffset(this->end())), "free_range reaches outside end of page");
+      _allocator->free_range((void*)curr,free_size);
+      _bytes_freed += free_size;
+      // log_debug(gc)("initadr : %p\ninitsiz : %zu", (void*)curr, free_size);
+      // log_debug(gc)("free %d %zu", (int)static_cast<uint>(this->age()), free_size);
+    }
+    curr = addr + ZUtils::object_size(addr);
+    return true;
+  };
+
+  _livemap.iterate_forced(_generation_id, free_internal_range);
+
+  size_t final_block_size = align_down(ZOffset::address(to_zoffset(end()))-curr, object_alignment());
+  if(final_block_size >= (long unsigned int)ZMinFreeBlockSize) {
+    assert(curr >= ZOffset::address(this->start()), "free_range starts before page start");
+    assert(curr + final_block_size <= ZOffset::address(to_zoffset(end())), "free_range reaches outside end of page");
+    _allocator->free_range((void*)curr, final_block_size);
+    _bytes_freed += final_block_size;
+    // log_debug(gc)("initadr : %p\ninitsiz : %zu", (void*)curr, final_block_size);
+    // log_debug(gc)("free %d %zu", (int)static_cast<uint>(this->age()), final_block_size);
+  }
+  // log_debug(gc)("FINISHED FREE LIST INITIALIZATION %p",(void*)start());
+  _free_list_time = os::elapsed_counter() - _free_list_time;
+  return true;
+}
+
+void ZPage::print_live_addresses() {
+  int age = 1;
+  if(_age == ZPageAge::old) {
+    age = 2;
+    // log_debug(gc)("OOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOLD PAGE FOUND");
+    return;
+  }
+
+  auto do_bit = [&](BitMap::idx_t index) -> bool {
+    zoffset offset = offset_from_bit_index(index);
+    const zaddress to_addr = ZOffset::address(offset);
+    const size_t size = ZUtils::object_size(to_addr);
+
+    // log_debug(gc)("livealocc  : %p\nlivesizze  : %lu", (void*)offset, size);
+    
+    return true;
+  };
+  _livemap.iterate_forced(_generation_id, do_bit);
+  // log_debug(gc)("Done Printing Live Addresses");
+}
+
+void ZPage::fill_page() {
+  _top = this->end();
+}
+
+zaddress ZPage::alloc_object_free_list(size_t size) {
+  // log_debug(gc)("\nalog page    : %p \
+  //                \nalog top     : %p \
+  //                \nalog start   : %p \
+  //                \nalog end     : %p \
+  //                \nalog offset  : %zu",
+  //                (void*)this,
+  //                (void*)top(),
+  //                (void*)start(),
+  //                (void*)end(),
+  //                size);  
+  const size_t aligned_size = align_up(size, object_alignment());
+  if(this->type() == ZPageType::small) {
+    // log_debug(gc)("reloc0 %d %zu", (int)static_cast<uint>(this->age()), aligned_size);
+  }
+  assert(!(_recycling_seqnum != generation()->seqnum() || _allocator == nullptr), "called free_list without initializing free list");
+  // if(_recycling_seqnum != generation()->seqnum() || _allocator == nullptr) {
+  //   return alloc_object(size);
+  // }
+  assert(this->age() != ZPageAge::old, "No recycling of Old pages");
+  // assert(false, "yaho");
+
+  // log_debug(gc)("reloc1 %d %zu", (int)static_cast<uint>(this->age()), aligned_size);
+
+  zaddress addr = to_zaddress((uintptr_t)_allocator->allocate(aligned_size));
+  if(is_null(addr)) {
+    // log_debug(gc)("failed %d %zu", (int)static_cast<uint>(this->age()), aligned_size);
+    _exhausted = true;
+    _failed_relocation_size = aligned_size;
+    return zaddress::null;
+  }
+
+  // if((uintptr_t)_top < ((uintptr_t)0x3ffffffffff & ((uintptr_t)addr+aligned_size))) {
+  //   log_debug(gc)("\ntop   : %p\nnewtop: %p", (void*)top(), (void*)to_zoffset_end(ZAddress::offset(addr),aligned_size));
+  // }
+
+  // _top = top() > to_zoffset_end(ZAddress::offset(addr),aligned_size) ?
+  //   top() :
+  //   to_zoffset_end(ZAddress::offset(addr),aligned_size);
+  // log_debug(gc)("\nlive objects: %d \
+                 \nalloc addr  : %p \
+                 \nsize        : %zu \
+                 \nnew top     : %p \
+                 \nthis        : %p \
+                 \n----------- \
+                 \n", live_objects(), (void*)addr, aligned_size , (void*)_top, (void*)this);
+  if((void*)addr != nullptr) {
+    // log_debug(gc)("recycle %d %zu", (int)static_cast<uint>(this->age()), aligned_size);
+  }
+  _bytes_used += aligned_size;  
+
+  return addr;
+}
+
+bool ZPage::exhausted() {
+  return _exhausted;
+}
+
+size_t ZPage::bytes_freed() {
+  return _bytes_freed;
+}
+size_t ZPage::bytes_used() {
+  return _bytes_used;
+}
+size_t ZPage::failed_relocation_size() {
+  return _failed_relocation_size;
+}
+jlong ZPage::get_free_list_time() {
+  return _free_list_time;
 }

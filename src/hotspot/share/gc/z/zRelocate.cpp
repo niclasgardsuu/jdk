@@ -385,6 +385,21 @@ zaddress ZRelocate::forward_object(ZForwarding* forwarding, zaddress_unsafe from
   return to_addr;
 }
 
+static ZPage* revive_page(ZPage* target) {
+  if (ZStressRelocateInPlace) {
+    // Simulate failure to revive a page. This will
+    // cause the page being relocated to be relocated in-place.
+    return nullptr;
+  }
+
+  if(target == nullptr) {
+    //there are no potential pages to revive
+    return nullptr;
+  }
+  
+  return target;
+}
+
 static ZPage* alloc_page(ZAllocatorForRelocation* allocator, ZPageType type, size_t size) {
   if (ZStressRelocateInPlace) {
     // Simulate failure to allocate a new page. This will
@@ -425,6 +440,21 @@ public:
     : _generation(generation),
       _in_place_count(0) {}
 
+  ZPage* revive_and_retire_target_page(ZForwarding* forwarding, ZPage* target) {
+    ZPage* page = revive_page(_generation->get_next_recyclable_page(forwarding->to_age()));
+    
+    if(page != nullptr) {
+      // page->print_live_addresses();
+    }
+
+    if (page != nullptr && target != nullptr) {
+      // Retire the old target page
+      retire_target_page(_generation, target);
+    }
+
+    return page;
+  }
+
   ZPage* alloc_and_retire_target_page(ZForwarding* forwarding, ZPage* target) {
     ZAllocatorForRelocation* const allocator = ZAllocator::relocation(forwarding->to_age());
     ZPage* const page = alloc_page(allocator, forwarding->type(), forwarding->size());
@@ -452,6 +482,10 @@ public:
 
   zaddress alloc_object(ZPage* page, size_t size) const {
     return (page != nullptr) ? page->alloc_object(size) : zaddress::null;
+  }
+
+  zaddress alloc_object_free_list(ZPage* page, size_t size) const {
+    return (page != nullptr) ? page->alloc_object_free_list(size) : zaddress::null;
   }
 
   void undo_alloc_object(ZPage* page, zaddress addr, size_t size) const {
@@ -493,6 +527,11 @@ public:
 
   void set_shared(ZPageAge age, ZPage* page) {
     _shared[static_cast<uint>(age) - 1] = page;
+  }
+
+  ZPage* revive_and_retire_target_page(ZForwarding* forwarding, ZPage* target) {
+    //alloc_and_retire_target_page(forwarding, target); //TODO implement for medium
+    return nullptr;
   }
 
   ZPage* alloc_and_retire_target_page(ZForwarding* forwarding, ZPage* target) {
@@ -548,6 +587,10 @@ public:
     return (page != nullptr) ? page->alloc_object_atomic(size) : zaddress::null;
   }
 
+  zaddress alloc_object_free_list(ZPage* page, size_t size) const {
+    return alloc_object(page, size); // Free list not supported for medium
+  }
+
   void undo_alloc_object(ZPage* page, zaddress addr, size_t size) const {
     page->undo_alloc_object_atomic(addr, size);
   }
@@ -563,6 +606,7 @@ private:
   Allocator* const   _allocator;
   ZForwarding*       _forwarding;
   ZPage*             _target[ZAllocator::_relocation_allocators];
+  ZPage*             _recycle_target[ZAllocator::_relocation_allocators];
   ZGeneration* const _generation;
   size_t             _other_promoted;
   size_t             _other_compacted;
@@ -573,6 +617,14 @@ private:
 
   void set_target(ZPageAge age, ZPage* page) {
     _target[static_cast<uint>(age) - 1] = page;
+  }
+
+  ZPage* recycle_target(ZPageAge age) {
+    return _recycle_target[static_cast<uint>(age) - 1];
+  }
+
+  void set_recycle_target(ZPageAge age, ZPage* page) {
+    _recycle_target[static_cast<uint>(age) - 1] = page;
   }
 
   size_t object_alignment() const {
@@ -591,8 +643,8 @@ private:
   zaddress try_relocate_object_inner(zaddress from_addr) {
     ZForwardingCursor cursor;
 
+
     const size_t size = ZUtils::object_size(from_addr);
-    ZPage* const to_page = target(_forwarding->to_age());
 
     // Lookup forwarding
     {
@@ -605,11 +657,25 @@ private:
     }
 
     // Allocate object
-    const zaddress allocated_addr = _allocator->alloc_object(to_page, size);
+    zaddress allocated_addr; 
+    
+    ZPage* to_page = recycle_target(_forwarding->to_age());
+    if(to_page != nullptr && size <= ZMaxRelocationInFreeLists) {
+      //Try to relocate into a free list if the object
+      //is small enough
+      allocated_addr = _allocator->alloc_object_free_list(to_page,size);
+    } else {
+      //If no free list available, or the object is
+      //too large, use a new page with bump pointer
+      to_page = target(_forwarding->to_age());
+      allocated_addr = _allocator->alloc_object(to_page, size);
+    }
+  
     if (is_null(allocated_addr)) {
       // Allocation failed
       return zaddress::null;
     }
+
 
     // Copy object. Use conjoint copying if we are relocating
     // in-place and the new object overlaps with the old object.
@@ -798,7 +864,6 @@ private:
 
   bool try_relocate_object(zaddress from_addr) {
     const zaddress to_addr = try_relocate_object_inner(from_addr);
-
     if (is_null(to_addr)) {
       return false;
     }
@@ -861,13 +926,25 @@ private:
   void relocate_object(oop obj) {
     const zaddress addr = to_zaddress(obj);
     assert(ZHeap::heap()->is_object_live(addr), "Should be live");
+    const size_t size = ZUtils::object_size(addr);
 
     while (!try_relocate_object(addr)) {
+      ZPage* to_page;
+      const ZPageAge to_age = _forwarding->to_age();
+      // Revive an page and use it as a target, if there are no
+      // pages left to choose from, try allocating a new target page
+      if(to_age != ZPageAge::old && size <= ZMaxRelocationInFreeLists) {
+        to_page = _allocator->revive_and_retire_target_page(_forwarding, target(to_age));
+        set_recycle_target(to_age, to_page);
+        if (to_page != nullptr) {
+          continue;
+        }
+      }
+
       // Allocate a new target page, or if that fails, use the page being
       // relocated as the new target, which will cause it to be relocated
       // in-place.
-      const ZPageAge to_age = _forwarding->to_age();
-      ZPage* to_page = _allocator->alloc_and_retire_target_page(_forwarding, target(to_age));
+      to_page = _allocator->alloc_and_retire_target_page(_forwarding, target(to_age));
       set_target(to_age, to_page);
       if (to_page != nullptr) {
         continue;
@@ -886,6 +963,7 @@ public:
     : _allocator(allocator),
       _forwarding(nullptr),
       _target(),
+      _recycle_target(),
       _generation(generation),
       _other_promoted(0),
       _other_compacted(0) {}
@@ -1064,7 +1142,7 @@ private:
 
 public:
   ZRelocateTask(ZRelocationSet* relocation_set, ZRelocateQueue* queue)
-    : ZRestartableTask("ZRelocateTask"),
+      : ZRestartableTask("ZRelocateTask"),
       _iter(relocation_set),
       _generation(relocation_set->generation()),
       _queue(queue),
@@ -1126,7 +1204,7 @@ public:
       for (ZForwarding* forwarding; (forwarding = _queue->synchronize_poll()) != nullptr;) {
         do_forwarding(forwarding);
       }
-
+      
       if (!do_forwarding_one_from_iter()) {
         // No more work
         break;
@@ -1247,6 +1325,7 @@ public:
   virtual void work() {
     SuspendibleThreadSetJoiner sts_joiner;
     ZArray<ZPage*> promoted_pages;
+    ZArray<ZPage*> recyclable_pages;
 
     for (ZPage* prev_page; _iter.next(&prev_page);) {
       const ZPageAge from_age = prev_page->age();
@@ -1271,6 +1350,15 @@ public:
 
       // Setup to-space page
       ZPage* const new_page = promotion ? prev_page->clone_limited_promote_flipped() : prev_page;
+      if(new_page->type() == ZPageType::small && 
+         to_age != ZPageAge::old && 
+         new_page->live_objects() > 0 &&
+         new_page->live_bytes() < ZRecycleMaximumLive*new_page->size()) {
+        //This page should now definitely be eligible for a free list
+        new_page->fill_page(); 
+        new_page->init_free_list();
+        recyclable_pages.push(new_page);
+      }
       new_page->reset(to_age, ZPageResetType::FlipAging);
 
       if (promotion) {
@@ -1279,10 +1367,13 @@ public:
         promoted_pages.push(prev_page);
       }
 
+
       SuspendibleThreadSet::yield();
     }
 
     ZGeneration::young()->register_flip_promoted(promoted_pages);
+    ZGeneration::young()->register_recycled_pages(recyclable_pages);
+    // ZGeneration::old()->register_recycled_pages(recyclable_pages);
   }
 };
 

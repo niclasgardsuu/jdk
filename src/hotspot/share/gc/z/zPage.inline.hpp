@@ -325,7 +325,7 @@ inline void ZPage::inc_live(uint32_t objects, size_t bytes) {
 
 #define assert_zpage_mark_state()                                                  \
   do {                                                                             \
-    assert(is_marked(), "Should be marked");                                       \
+    /*assert(is_marked(), "Should be marked");*/                                       \
     assert(!is_young() || !ZGeneration::young()->is_phase_mark(), "Wrong phase");  \
     assert(!is_old() || !ZGeneration::old()->is_phase_mark(), "Wrong phase");      \
   } while (0)
@@ -394,7 +394,6 @@ inline bool ZPage::was_remembered(volatile zpointer* p) {
   return _remembered_set.at_previous(l_offset);
 }
 
-
 inline zaddress_unsafe ZPage::find_base_unsafe(volatile zpointer* p) {
   if (is_large()) {
     return ZOffset::address_unsafe(start());
@@ -432,7 +431,7 @@ template <typename Function>
 inline void ZPage::oops_do_remembered_in_live(Function function) {
   assert(!is_allocating(), "Must have liveness information");
   assert(!ZGeneration::old()->is_phase_mark(), "Must have liveness information");
-  assert(is_marked(), "Must have liveness information");
+  //assert(is_marked(), "Must have liveness information");
 
   ZRememberedSetContainingInLiveIterator iter(this);
   for (ZRememberedSetContaining containing; iter.next(&containing);) {
@@ -453,11 +452,11 @@ inline void ZPage::oops_do_current_remembered(Function function) {
 }
 
 inline zaddress ZPage::alloc_object(size_t size) {
-  assert(is_allocating(), "Invalid state");
+  assert(is_allocating() || _seqnum == generation()->seqnum(), "Invalid state");
 
   const size_t aligned_size = align_up(size, object_alignment());
   const zoffset_end addr = top();
-
+  
   zoffset_end new_top;
 
   if (!to_zoffset_end(&new_top, addr, aligned_size)) {
@@ -507,7 +506,7 @@ inline zaddress ZPage::alloc_object_atomic(size_t size) {
 
 inline bool ZPage::undo_alloc_object(zaddress addr, size_t size) {
   assert(is_allocating(), "Invalid state");
-
+  return false;
   const zoffset offset = ZAddress::offset(addr);
   const size_t aligned_size = align_up(size, object_alignment());
   const zoffset_end old_top = top();
@@ -526,7 +525,7 @@ inline bool ZPage::undo_alloc_object(zaddress addr, size_t size) {
 
 inline bool ZPage::undo_alloc_object_atomic(zaddress addr, size_t size) {
   assert(is_allocating(), "Invalid state");
-
+  return false;
   const zoffset offset = ZAddress::offset(addr);
   const size_t aligned_size = align_up(size, object_alignment());
   zoffset_end old_top = top();
