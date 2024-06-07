@@ -24,6 +24,8 @@
 #ifndef SHARE_GC_Z_ZPAGE_HPP
 #define SHARE_GC_Z_ZPAGE_HPP
 
+#include "gc/z/ZAllocators.hpp"
+#include "gc/z/AllocatorWrapper.hpp"
 #include "gc/z/zGenerationId.hpp"
 #include "gc/z/zList.hpp"
 #include "gc/z/zLiveMap.hpp"
@@ -54,19 +56,26 @@ class ZPage : public CHeapObj<mtGC> {
   friend class ZForwardingTest;
 
 private:
-  ZPageType            _type;
-  ZGenerationId        _generation_id;
-  ZPageAge             _age;
-  uint8_t              _numa_id;
-  uint32_t             _seqnum;
-  uint32_t             _seqnum_other;
-  ZVirtualMemory       _virtual;
-  volatile zoffset_end _top;
-  ZLiveMap             _livemap;
-  ZRememberedSet       _remembered_set;
-  uint64_t             _last_used;
-  ZPhysicalMemory      _physical;
-  ZListNode<ZPage>     _node;
+  ZPageType                             _type;
+  ZGenerationId                         _generation_id;
+  ZPageAge                              _age;
+  uint8_t                               _numa_id;
+  uint32_t                              _seqnum;
+  uint32_t                              _recycling_seqnum;
+  uint32_t                              _seqnum_other;
+  ZVirtualMemory                        _virtual;
+  volatile zoffset_end                  _top;
+  ZLiveMap                              _livemap;
+  ZRememberedSet                        _remembered_set;
+  uint64_t                              _last_used;
+  ZPhysicalMemory                       _physical;
+  ZListNode<ZPage>                      _node;
+  ZAllocatorWrapper*                    _allocator;
+  bool                                  _exhausted;
+  size_t                                _bytes_freed;
+  size_t                                _bytes_used;
+  size_t                                _failed_relocation_size;
+  jlong                                 _free_list_time;
 
   ZPageType type_from_size(size_t size) const;
   const char* type_to_string() const;
@@ -81,7 +90,6 @@ private:
   ZGeneration* generation();
   const ZGeneration* generation() const;
 
-  void reset_seqnum();
   void reset_remembered_set();
 
   ZPage* split_with_pmem(ZPageType type, const ZPhysicalMemory& pmem);
@@ -91,6 +99,8 @@ private:
 public:
   ZPage(ZPageType type, const ZVirtualMemory& vmem, const ZPhysicalMemory& pmem);
 
+  void reset_seqnum();
+  void reset_recycling_seqnum(); // TODO
   ZPage* clone_limited() const;
   ZPage* clone_limited_promote_flipped() const;
 
@@ -204,6 +214,7 @@ public:
 
   zaddress alloc_object(size_t size);
   zaddress alloc_object_atomic(size_t size);
+  zaddress alloc_object_free_list(size_t size);
 
   bool undo_alloc_object(zaddress addr, size_t size);
   bool undo_alloc_object_atomic(zaddress addr, size_t size);
@@ -220,6 +231,15 @@ public:
   void verify_live(uint32_t live_objects, size_t live_bytes, bool in_place) const;
 
   void fatal_msg(const char* msg) const;
+
+  bool init_free_list();
+  void fill_page();
+  void print_live_addresses();
+  bool exhausted();
+  size_t bytes_freed();
+  size_t bytes_used();
+  size_t failed_relocation_size();
+  jlong get_free_list_time();
 };
 
 class ZPageClosure {

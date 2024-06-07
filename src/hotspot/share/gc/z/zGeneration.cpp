@@ -119,6 +119,7 @@ ZGeneration::ZGeneration(ZGenerationId id, ZPageTable* page_table, ZPageAllocato
     _mark(this, page_table),
     _relocate(this),
     _relocation_set(this),
+    _r_page_index(/*{0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0}*/),
     _freed(0),
     _promoted(0),
     _compacted(0),
@@ -276,6 +277,11 @@ void ZGeneration::reset_relocation_set() {
 
   // Reset relocation set
   _relocation_set.reset(_page_allocator);
+
+  // Reset recyclable page indecies for every age
+  for (uint age = 0; age < ZPageAgeMax + 1; age++) {
+    _r_page_index[age] = 0;
+  }
 }
 
 void ZGeneration::synchronize_relocation() {
@@ -865,7 +871,7 @@ void ZGenerationYoung::mark_start() {
   // Enter mark phase
   set_phase(Phase::Mark);
 
-  // Reset marking information
+  // Reset marking information and mark roots
   _mark.start();
 
   // Flip remembered set bits
@@ -927,6 +933,7 @@ void ZGenerationYoung::relocate() {
   _relocate.relocate(&_relocation_set);
 
   // Update statistics
+  _relocation_set.print_all_r_pages();
   stat_heap()->at_relocate_end(_page_allocator->stats(this), should_record_stats());
 }
 
@@ -1217,7 +1224,7 @@ void ZGenerationOld::mark_start() {
   // Enter mark phase
   set_phase(Phase::Mark);
 
-  // Reset marking information
+  // Reset marking information and mark roots
   _mark.start();
 
   // Update statistics
@@ -1322,7 +1329,6 @@ void ZGenerationOld::process_non_strong_references() {
   _weak_roots_processor.process_weak_roots();
 
   ClassUnloadingContext ctx(_workers.active_workers(),
-                            true /* unregister_nmethods_during_purge */,
                             true /* lock_codeblob_free_separately */);
 
   // Unlink stale metadata and nmethods
@@ -1516,4 +1522,23 @@ uint ZGenerationOld::total_collections_at_start() const {
 
 ZGenerationTracer* ZGenerationOld::jfr_tracer() {
   return &_jfr_tracer;
+}
+
+ZPage* ZGeneration::get_next_recyclable_page(ZPageAge age) {
+  ZPage* r = _relocation_set.get_r_page(age, Atomic::fetch_then_add(&_r_page_index[static_cast<uint>(age)], 1u));
+  // log_debug(gc)("GENERATION::GET_NEXT_RECYCLABLE page %p, age %zu, index %zu", (void*)r, (size_t)age, _r_page_index[static_cast<uint>(age)]);
+  if(r != nullptr)
+    return r;
+  else
+    return nullptr;
+}
+
+void ZGeneration::print_all_r_pages() {
+  _relocation_set.print_all_r_pages();
+}
+
+void ZGeneration::register_recycled_pages(const ZArray<ZPage*>& pages) {
+  _relocation_set.register_recycled_pages(pages);
+  //statistics
+
 }

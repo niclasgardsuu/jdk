@@ -67,9 +67,22 @@
   develop(bool, ZVerifyOops, false,                                         \
           "Verify accessed oops")                                           \
                                                                             \
+  product(bool, ZUseBuddyAllocator, false, DIAGNOSTIC,                      \
+          "Choose free list allocator")                                     \
+                                                                            \
   product(int, ZTenuringThreshold, -1, DIAGNOSTIC,                          \
           "Young generation tenuring threshold, -1 for dynamic computation")\
           range(-1, static_cast<int>(ZPageAgeMax))                          \
+                                                                            \
+  product(int, ZMinFreeBlockSize, 16, DIAGNOSTIC,"")                        \
+          range(16, 2097152 /*Small Page Size*/)                            \
+                                                                            \
+  product(double, ZMaxRelocationInFreeLists, 262144, DIAGNOSTIC,"")         \
+          range(16, 262144 /* Max object size in Small Page*/)              \
+                                                                            \
+                                                                            \
+  product(double, ZRecycleMaximumLive, 1, DIAGNOSTIC,"")                    \
+          range(0, 1 /* 100% */)                                            \
                                                                             \
   develop(size_t, ZForceDiscontiguousHeapReservations, 0,                   \
           "The gc will attempt to split the heap reservation into this "    \
